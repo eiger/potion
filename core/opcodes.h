@@ -17,11 +17,15 @@ typedef struct {
 
 #pragma pack(pop)
 
+#define PN_OP_AT(asmb, n) ((PN_OP *)((PNFlex *)asmb)->ptr)[n]
+#define PN_OP_LEN(asmb)   (PN_FLEX_SIZE(asmb) / sizeof(PN_OP))
+
 enum PN_OPCODE {
   OP_NONE,
   OP_MOVE,
   OP_LOADK,
   OP_LOADPN,
+  OP_SELF,
   OP_NEWTUPLE,
   OP_SETTUPLE,
   OP_GETLOCAL,
@@ -30,6 +34,7 @@ enum PN_OPCODE {
   OP_SETUPVAL,
   OP_GETTABLE,
   OP_SETTABLE,
+  OP_NEWLICK,
   OP_GETPATH,
   OP_SETPATH,
   OP_ADD,
@@ -46,17 +51,23 @@ enum PN_OPCODE {
   OP_LTE,
   OP_GT,
   OP_GTE,
+  OP_BITN,
   OP_BITL,
   OP_BITR,
+  OP_DEF,
   OP_BIND,
+  OP_MESSAGE,
   OP_JMP,
   OP_TEST,
   OP_TESTJMP,
   OP_NOTJMP,
+  OP_NAMED,
   OP_CALL,
+  OP_CALLSET,
   OP_TAILCALL,
   OP_RETURN,
-  OP_PROTO
+  OP_PROTO,
+  OP_CLASS
 };
 
 #endif

@@ -5,12 +5,16 @@
 // (c) 2008 why the lucky stiff, the freelance professor
 //
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/stat.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "potion.h"
 #include "internal.h"
 #include "opcodes.h"
+#include "khash.h"
+#include "table.h"
 
 const char potion_banner[] = "potion " POTION_VERSION
                              " (date='" POTION_DATE "', commit='" POTION_COMMIT
@@ -35,35 +39,39 @@ static void potion_cmd_usage() {
   );
 }
 
-static void potion_cmd_stats() {
-  printf("sizeof(PN): %d\nsizeof(PNGarbage): %d\nsizeof(PNObject): %d\n",
-      (int)sizeof(PN), (int)sizeof(struct PNGarbage), (int)sizeof(struct PNObject));
-  printf("sizeof(PNTuple): %d\nsizeof(PN + PNTuple): %d\n",
-      (int)sizeof(struct PNTuple), (int)(sizeof(PN) + sizeof(struct PNTuple)));
+static void potion_cmd_stats(void *sp) {
+  Potion *P = potion_create(sp);
+  printf("sizeof(PN=%d, PNObject=%d, PNTuple=%d, PNTuple+1=%d, PNTable=%d)\n",
+      (int)sizeof(PN), (int)sizeof(struct PNObject), (int)sizeof(struct PNTuple),
+      (int)(sizeof(PN) + sizeof(struct PNTuple)), (int)sizeof(struct PNTable));
+  printf("GC (fixed=%ld, actual=%ld, reserved=%ld)\n",
+      PN_INT(potion_gc_fixed(P, 0, 0)), PN_INT(potion_gc_actual(P, 0, 0)),
+      PN_INT(potion_gc_reserved(P, 0, 0)));
+  potion_destroy(P);
 }
 
 static void potion_cmd_version() {
   printf(potion_banner, POTION_JIT);
 }
 
-static void potion_cmd_compile(char *filename, int exec, int verbose) {
+static void potion_cmd_compile(char *filename, int exec, int verbose, void *sp) {
   PN buf;
-  FILE *fp;
+  int fd = -1;
   struct stat stats;
-  Potion *P = potion_create();
+  Potion *P = potion_create(sp);
   if (stat(filename, &stats) == -1) {
     fprintf(stderr, "** %s does not exist.", filename);
     goto done;
   }
 
-  fp = fopen(filename, "rb");
-  if (!fp) {
+  fd = open(filename, O_RDONLY | O_BINARY);
+  if (fd == -1) {
     fprintf(stderr, "** could not open %s. check permissions.", filename);
     goto done;
   }
 
-  buf = potion_bytes(P, stats.st_size + 1);
-  if (fread(PN_STR_PTR(buf), 1, stats.st_size, fp) == stats.st_size) {
+  buf = potion_bytes(P, stats.st_size);
+  if (read(fd, PN_STR_PTR(buf), stats.st_size) == stats.st_size) {
     PN code;
     PN_STR_PTR(buf)[stats.st_size] = '\0';
     code = potion_source_load(P, PN_NIL, buf);
@@ -72,6 +80,10 @@ static void potion_cmd_compile(char *filename, int exec, int verbose) {
         printf("\n\n-- loaded --\n");
     } else {
       code = potion_parse(P, buf);
+      if (PN_TYPE(code) == PN_TERROR) {
+        potion_send(potion_send(code, PN_string), PN_print);
+        goto done;
+      }
       if (verbose > 1) {
         printf("\n-- parsed --\n");
         potion_send(potion_send(code, PN_string), PN_print);
@@ -86,20 +98,25 @@ static void potion_cmd_compile(char *filename, int exec, int verbose) {
       printf("\n");
     }
     if (exec == 1) {
-      code = potion_vm(P, code, PN_NIL, 0, NULL);
+      code = potion_vm(P, code, P->lobby, PN_NIL, 0, NULL);
       if (verbose > 1)
-        printf("\n-- returned %lu --\n", code);
+        printf("\n-- vm returned %p (fixed=%ld, actual=%ld, reserved=%ld) --\n", (void *)code,
+          PN_INT(potion_gc_fixed(P, 0, 0)), PN_INT(potion_gc_actual(P, 0, 0)),
+          PN_INT(potion_gc_reserved(P, 0, 0)));
       if (verbose) {
         potion_send(potion_send(code, PN_string), PN_print);
         printf("\n");
       }
     } else if (exec == 2) {
-#ifdef X86_JIT
+#if POTION_JIT == 1
       PN val;
-      PN_F func = potion_x86_proto(P, code);
-      val = func(P, PN_NIL, PN_NIL);
+      PN cl = potion_closure_new(P, (PN_F)potion_jit_proto(P, code, POTION_JIT_TARGET), PN_NIL, 1);
+      PN_CLOSURE(cl)->data[0] = code;
+      val = PN_PROTO(code)->jit(P, cl, P->lobby);
       if (verbose > 1)
-        printf("\n-- jit returned %p --\n", func);
+        printf("\n-- jit returned %p (fixed=%ld, actual=%ld, reserved=%ld) --\n", PN_PROTO(code)->jit,
+          PN_INT(potion_gc_fixed(P, 0, 0)), PN_INT(potion_gc_actual(P, 0, 0)),
+          PN_INT(potion_gc_reserved(P, 0, 0)));
       if (verbose) {
         potion_send(potion_send(val, PN_string), PN_print);
         printf("\n");
@@ -126,17 +143,41 @@ static void potion_cmd_compile(char *filename, int exec, int verbose) {
         fprintf(stderr, "** could not write all bytecode.");
       }
     }
+
+#if 0
+    void *scanptr = (void *)((char *)P->mem->old_lo + (sizeof(PN) * 2));
+    while ((PN)scanptr < (PN)P->mem->old_cur) {
+          printf("%p.vt = %lx (%u)\n",
+            scanptr, ((struct PNObject *)scanptr)->vt,
+            potion_type_size(P, scanptr));
+      if (((struct PNFwd *)scanptr)->fwd != POTION_FWD && ((struct PNFwd *)scanptr)->fwd != POTION_COPIED) {
+        if (((struct PNObject *)scanptr)->vt < 0 || ((struct PNObject *)scanptr)->vt > PN_TUSER) {
+          printf("wrong type for allocated object: %p.vt = %lx\n",
+            scanptr, ((struct PNObject *)scanptr)->vt);
+          break;
+        }
+      }
+      scanptr = (void *)((char *)scanptr + potion_type_size(P, scanptr));
+      if ((PN)scanptr > (PN)P->mem->old_cur) {
+        printf("allocated object goes beyond GC pointer\n");
+        break;
+      }
+    }
+#endif
+
   } else {
     fprintf(stderr, "** could not read entire file.");
   }
 
-  fclose(fp);
-
 done:
-  potion_destroy(P);
+  if (fd != -1)
+    close(fd);
+  if (P != NULL)
+    potion_destroy(P);
 }
 
 int main(int argc, char *argv[]) {
+  POTION_INIT_STACK(sp);
   int i, verbose = 0, exec = 1 + POTION_JIT;
 
   if (argc > 1) {
@@ -167,7 +208,7 @@ int main(int argc, char *argv[]) {
 
       if (strcmp(argv[i], "-s") == 0 ||
           strcmp(argv[i], "--stats") == 0) {
-        potion_cmd_stats();
+        potion_cmd_stats(sp);
         return 0;
       }
 
@@ -187,11 +228,23 @@ int main(int argc, char *argv[]) {
       }
     }
 
-    potion_cmd_compile(argv[argc-1], exec, verbose);
+    potion_cmd_compile(argv[argc-1], exec, verbose, sp);
     return 0;
   }
 
-  fprintf(stderr, "// TODO: read from stdin\n");
-  potion_cmd_usage();
+  Potion *P = potion_create(sp);
+  potion_eval(P, potion_byte_str(P,
+    "loop:\n" \
+    "  '>> ' print\n" \
+    "  code = read\n" \
+    "  if (not code): break.\n" \
+    "  if (code != ''):\n" \
+    "    obj = code eval\n" \
+    "    if (obj kind == Error):\n" \
+    "      obj string print." \
+    "    else: ('=> ', obj, \"\\n\") join print.\n" \
+    "  .\n"
+    "."));
+  potion_destroy(P);
   return 0;
 }

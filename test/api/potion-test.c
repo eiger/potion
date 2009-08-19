@@ -57,7 +57,7 @@ void potion_test_int3(CuTest *T) {
 }
 
 void potion_test_decimal(CuTest *T) {
-  PN dec = potion_decimal(P, 5, 5, "14466");
+  PN dec = potion_decimal(P, "14466", 5);
   CuAssert(T, "decimal not a number", PN_TYPE(dec) == PN_TNUMBER);
 }
 
@@ -96,11 +96,22 @@ void potion_test_sig(CuTest *T) {
 }
 
 void potion_test_eval(CuTest *T) {
-  PN add = potion_eval(P, "(x, y): x + y.");
+  PN add = potion_eval(P, potion_str(P, "(x, y): x + y."));
   PN_F addfn = PN_CLOSURE_F(add);
-  PN num = addfn(P, 0, 0, PN_NUM(3), PN_NUM(5));
+  PN num = addfn(P, add, 0, PN_NUM(3), PN_NUM(5));
   CuAssertIntEquals(T, "calling closure as c func failed",
     PN_INT(num), 8);
+}
+
+void potion_test_allocated(CuTest *T) {
+  void *scanptr = (void *)((char *)P->mem->birth_lo + PN_ALIGN(sizeof(struct PNMemory), 8));
+  while ((PN)scanptr < (PN)P->mem->birth_cur) {
+    if (((struct PNFwd *)scanptr)->fwd != POTION_FWD && ((struct PNFwd *)scanptr)->fwd != POTION_COPIED) {
+      CuAssert(T, "wrong type for allocated object", ((struct PNObject *)scanptr)->vt <= PN_TUSER);
+    }
+    scanptr = (void *)((char *)scanptr + potion_type_size(P, scanptr));
+    CuAssert(T, "allocated object goes beyond GC pointer", (PN)scanptr <= (PN)P->mem->birth_cur);
+  }
 }
 
 CuSuite *potion_suite() {
@@ -116,12 +127,14 @@ CuSuite *potion_suite() {
   SUITE_ADD_TEST(S, potion_test_tuple);
   SUITE_ADD_TEST(S, potion_test_sig);
   SUITE_ADD_TEST(S, potion_test_eval);
+  SUITE_ADD_TEST(S, potion_test_allocated);
   return S;
 }
 
 int main(void) {
+  POTION_INIT_STACK(sp);
   int count;
-  P = potion_create();
+  P = potion_create(sp);
   CuString *out = CuStringNew();
   CuSuite *suite = potion_suite();
   CuSuiteRun(suite);
@@ -131,6 +144,5 @@ int main(void) {
   count = suite->failCount;
   CuSuiteFree(suite);
   CuStringFree(out);
-  potion_destroy(P);
   return count;
 }

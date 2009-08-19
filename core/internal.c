@@ -6,20 +6,25 @@
 //
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include "potion.h"
 #include "internal.h"
+#include "gc.h"
 
-#define TYPE_BATCH_SIZE 64
-
-PN PN_allocate, PN_break, PN_call, PN_compile, PN_continue, PN_def,
+PN PN_allocate, PN_break, PN_call, PN_class, PN_compile, PN_continue, PN_def,
    PN_delegated, PN_else, PN_elsif, PN_if, PN_lookup, PN_loop, PN_print,
-   PN_return, PN_string, PN_while, PN__link;
+   PN_return, PN_self, PN_string, PN_while;
+PN PN_add, PN_sub, PN_mult, PN_div, PN_rem, PN_bitn, PN_bitl, PN_bitr;
+
+PN potion_allocate(Potion *P, PN cl, PN self, PN len) {
+  struct PNData *obj = PN_ALLOC_N(PN_TUSER, struct PNData, PN_INT(len));
+  obj->siz = len;
+  return (PN)obj;
+}
 
 static void potion_init(Potion *P) {
   PN vtable, obj_vt;
   P->lobby = potion_type_new(P, PN_TLOBBY, 0);
-  vtable = potion_type_new(P, PN_TVTABLE, 0);
+  vtable = potion_type_new(P, PN_TVTABLE, P->lobby);
   obj_vt = potion_type_new(P, PN_TOBJECT, P->lobby);
   potion_type_new(P, PN_TNIL, obj_vt);
   potion_type_new(P, PN_TNUMBER, obj_vt);
@@ -32,10 +37,11 @@ static void potion_init(Potion *P) {
   potion_type_new(P, PN_TSOURCE, obj_vt);
   potion_type_new(P, PN_TBYTES, obj_vt);
   potion_type_new(P, PN_TPROTO, obj_vt);
-  potion_type_new(P, PN_TLOBBY, 0);
   potion_type_new(P, PN_TWEAK, obj_vt);
+  potion_type_new(P, PN_TLICK, obj_vt);
+  potion_type_new(P, PN_TERROR, obj_vt);
+  potion_type_new(P, PN_TCONT, obj_vt);
   potion_str_hash_init(P);
-  potion_lobby_init(P);
 
   PN_allocate = potion_str(P, "allocate");
   PN_break = potion_str(P, "break");
@@ -43,6 +49,7 @@ static void potion_init(Potion *P) {
   PN_continue = potion_str(P, "continue");
   PN_def = potion_str(P, "def");
   PN_delegated = potion_str(P, "delegated");
+  PN_class = potion_str(P, "class");
   PN_compile = potion_str(P, "compile");
   PN_else = potion_str(P, "else");
   PN_elsif = potion_str(P, "elsif");
@@ -51,49 +58,65 @@ static void potion_init(Potion *P) {
   PN_loop = potion_str(P, "loop");
   PN_print = potion_str(P, "print");
   PN_return = potion_str(P, "return");
+  PN_self = potion_str(P, "self");
   PN_string = potion_str(P, "string");
   PN_while = potion_str(P, "while");
-  PN__link = potion_str(P, "~link");
+
+  PN_add = potion_str(P, "+");
+  PN_sub = potion_str(P, "-");
+  PN_mult = potion_str(P, "*");
+  PN_div = potion_str(P, "/");
+  PN_rem = potion_str(P, "%");
+  PN_bitn = potion_str(P, "~");
+  PN_bitl = potion_str(P, "<<");
+  PN_bitr = potion_str(P, ">>");
 
   potion_def_method(P, 0, vtable, PN_lookup, PN_FUNC(potion_lookup, 0));
-  potion_def_method(P, 0, vtable, PN_def, PN_FUNC(potion_def_method, 0));
+  potion_def_method(P, 0, vtable, PN_def, PN_FUNC(potion_def_method, "name=S,block=&"));
 
   potion_send(vtable, PN_def, PN_allocate, PN_FUNC(potion_allocate, 0));
   potion_send(vtable, PN_def, PN_delegated, PN_FUNC(potion_delegated, 0));
 
+  potion_vm_init(P);
+  potion_lobby_init(P);
   potion_object_init(P);
+  potion_error_init(P);
+  potion_cont_init(P);
   potion_primitive_init(P);
   potion_num_init(P);
   potion_str_init(P);
   potion_table_init(P);
   potion_source_init(P);
+  potion_lick_init(P);
   potion_compiler_init(P);
+  potion_file_init(P);
+
+  GC_PROTECT(P);
 }
 
-Potion *potion_create() {
-  Potion *P = PN_ALLOC(Potion);
-  PN_MEMZERO(P, Potion);
-  PN_GB(P);
+Potion *potion_create(void *sp) {
+  Potion *P = potion_gc_boot(sp);
   P->vt = PN_TSTATE;
-  P->typea = TYPE_BATCH_SIZE;
-  P->typen = PN_TUSER;
-  P->vts = PN_ALLOC_N(PN, P->typea);
+  P->uniq = (PNUniq)potion_rand_int();
+  PN_FLEX_NEW(P->vts, PN_TFLEX, PNFlex, TYPE_BATCH_SIZE);
+  PN_FLEX_SIZE(P->vts) = PN_TYPE_ID(PN_TUSER) + 1;
+  P->prec = PN_PREC;
   potion_init(P);
   return P;
 }
 
-PN potion_delegated(Potion *P, PN closure, PN self) {
-  PNType t = P->typen++;
-  PN vt = potion_type_new(P, t, self);
-
-  // TODO: expand the main vtable if full
-  if (P->typea == P->typen)
-    printf("Vtable out of room!\n");
-  return vt;
+void potion_destroy(Potion *P) {
+  potion_gc_release(P);
 }
 
-PN potion_call(Potion *P, PN cl, PN_SIZE argc, PN *argv) {
-  struct PNClosure *c = PN_CLOSURE(cl);
+PN potion_delegated(Potion *P, PN closure, PN self) {
+  PNType t = PN_FLEX_SIZE(P->vts) + PN_TNIL;
+  PN_FLEX_NEEDS(1, P->vts, PN_TFLEX, PNFlex, TYPE_BATCH_SIZE);
+  return potion_type_new(P, t, self);
+}
+
+PN potion_call(Potion *P, PN cl, PN_SIZE argc, PN * volatile argv) {
+  vPN(Closure) c = PN_CLOSURE(cl);
   switch (argc) {
     case 0:
     return c->method(P, cl, cl);
@@ -146,4 +169,58 @@ PN potion_call(Potion *P, PN cl, PN_SIZE argc, PN *argv) {
 
 PNType potion_kind_of(PN obj) {
   return potion_type(obj);
+}
+
+PN potion_error(Potion *P, PN msg, long lineno, long charno, PN excerpt) {
+  struct PNError *e = PN_ALLOC(PN_TERROR, struct PNError);
+  e->message = msg;
+  e->line = PN_NUM(lineno);
+  e->chr = PN_NUM(charno);
+  e->excerpt = excerpt;
+  return (PN)e;
+}
+
+PN potion_error_string(Potion *P, PN cl, PN self) {
+  vPN(Error) e = (struct PNError *)self;
+  if (e->excerpt == PN_NIL)
+    return potion_str_format(P, "** %s\n", PN_STR_PTR(e->message));
+  return potion_str_format(P, "** %s\n"
+    "** Where: (line %ld, character %ld) %s\n", PN_STR_PTR(e->message),
+    PN_INT(e->line), PN_INT(e->chr), PN_STR_PTR(e->excerpt));
+}
+
+void potion_error_init(Potion *P) {
+  PN err_vt = PN_VTABLE(PN_TERROR);
+  potion_method(err_vt, "string", potion_error_string, 0);
+}
+
+void potion_p(Potion *P, PN x) {
+  potion_send(potion_send(x, PN_string), PN_print);
+  printf("\n");
+}
+
+void potion_esp(void **esp) {
+  PN x;
+  *esp = (void *)&x;
+}
+
+void potion_dump_stack(Potion *P) {
+  PN_SIZE n;
+  PN *end, *ebp, *start = P->mem->cstack;
+  POTION_ESP(&end);
+  POTION_EBP(&ebp);
+#if POTION_STACK_DIR > 0
+  n = end - start;
+#else
+  n = start - end + 1;
+  start = end;
+  end = P->mem->cstack;
+#endif
+
+  printf("-- dumping %u from %p to %p --\n", n, start, end);
+  printf("   ebp = %p, *ebp = %lx\n", ebp, *ebp);
+  while (n--) {
+    printf("   stack(%u) = %lx\n", n, *start);
+    start++;
+  }
 }

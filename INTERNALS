@@ -34,58 +34,41 @@
 
                      ~
 
-  On a related note, I would like to say
-  something to all of the parties working on
-  languages atop abstracted runtimes, such as the
-  JVM and .Net and Parrot.
+  This doc is going to touch quite a bit on
+  the JIT, compiling straight to x86 and PowerPC
+  instructions. So many languages are targetting
+  the JVM and .Net these days... it made me
+  wonder what the hurdles are to generating
+  machine code directly.
 
-  The first thing is: you should try target-
-  ting x86. It's very popular!
+  Clearly, the biggest benefit of having a
+  common runtime is garbage collection. The
+  JVM has some wild GC algorithms built in.
+  And that's actually a huge benefit. I only
+  wish that more garbage collectors were
+  available as libraries.
 
-  How big is Java? How big is .Net?
-  Caesar's Hounds, people. Java has a systray
-  icon and update alerts and browser toolbar. Are
-  those features? x86 gets by without!
+  Anyways, my favorite language has been Ruby
+  for many years, that's partially because
+  I like how easy it is to script from C,
+  for some efficiency where I need it. So
+  Potion is my little attempt to make a
+  language that feels easy, but compiles
+  to machine code, to give me the speed of
+  (un-optimized) C code and to use all the
+  C function call conventions so that I
+  can link to other C libs. I want to see
+  if its still possible to enroach on C.
 
-  My JIT is a few hundred lines of code.
-  That turns out to be like a 100k.
-  Why is everyone so afraid of assembler??
-
-  Well, sure, I can't run on ARM. But give me
-  another few hundred lines of code.
-
-  I'm not suggesting that x86 is my favorite
-  architecture. Just that it's everywhere, it's
-  easy to write for, and it's got no excess when
-  compared to these big, entrenched abstractions.
-
-                     ~
-
-  LLVM is a neat exercise, but I found it to be
-  much scarier than assembler. I'm sure I'd see
-  a lot of benefits by using LLVM to squeeze out
-  some optimization. But it wouldn't be any less
-  code and it would take me a lot longer to sort
-  through the docs.
-
-  What would be great is an LLVM where you just
-  write x86 machine code and then it'll optimize
-  it or translate to other machine codes. But
-  small enough to statically link into your
-  program.
-
-  Again, LLVM is megs of stuff. What about a
-  C include that acts as a simple assembler into
-  a string buffer and makes some common
-  optimizations?
-
-  Enough opinions. Man alive. Now then. A round
-  of apologies, on the house.
+  I should say that O'Caml and Haskell
+  already do a fine job as C competitors,
+  so it's not like anything here is that
+  new.
 
 
   ~ lua's influence ~
 
-  Potion used a register-based bytecode VM that
+  Potion uses a register-based bytecode VM that
   is nearly a word-for-word copy of Lua's. The
   code is all different, but the bytecode is
   nearly identical.
@@ -103,16 +86,15 @@
 
   However, my object representation is more
   like Neko or Ruby, where objects are all
-  represented by 32-bit values.
+  represented by a word (32-bit on x86 and
+  64-bit on x86-64).
 
 
   ~ the parts of potion ~
 
   1. the parser
-     - lexer written with Ragel
-       (see core/pn-scan.rl)
-     - parser written with Lemon
-       (see core/pn-scan.y)
+     - written in peg
+       (see core/syntax.g)
      - produces a syntax tree
      - the tree is a Potion object that can
        be traversed in the code
@@ -140,6 +122,18 @@
        pointer
      - uses the same argument passing strategy
        as c functions
+
+  5. the garbage collector
+     - generational, copying, near exact
+     - marks the stack, then uses a cheney
+       loop to catch everything else
+     - stack scanning is automatic (both
+       the jit and the bytecode vm keep
+       their registers on the call stack)
+     - liberal use of volatile for object
+       pointers, to allow them to move
+       after any allocation
+     - based on a collector called qish
 
 
   ~ the jit ~
@@ -293,4 +287,269 @@
   That's the purpose behind the function named
   potion_x86_c_arg. To shuttle the arguments
   in and out, depending on the architecture.
+
+
+  ~ using disassemblers ~
+
+  I don't really know the x86 instruction set
+  too well and most often I just write something
+  in C and disassemble it.
+
+    $ gcc test.c -o test
+    $ objdump --disassemble-all test
+
+  However, objdump doesn't come with the OS X
+  dev tools, so you can use the included
+  machodis.pl by Robert Kelp to inspect the
+  binary.
+
+    $ ./tools/machodis.pl test
+
+
+  ~ the garbage collector ~
+
+  Potion's garbage collector is based on the
+  work Basile Starynkevitch performed with his
+  small generational GC entitled Qish. As with
+  everything else in Potion, the goal isn't to
+  be the best, but to experiment with what sort
+  of advanced features can be squeezed into a
+  language while keeping the code compact.
+
+  Since Potion interpreters are per-thread,
+  each interpreter has its own GC heap. This
+  allows interpreters to run in parallel and
+  to start up and shut down independently.
+  Perhaps one day the GC will run in parallel.
+ 
+  Qish is a two-finger generational collector.
+  (Also called a Cheney loop.) This collector
+  only has two generations. When the time for
+  garbage collection arrives, everything from
+  the call stack is scanned and moved from the
+  young gen to the older gen. The insides of
+  all those objects are then scanned and moved
+  as well. The goal is simply to wipe out the
+  birth region and replace it with another.
+
+  What about objects from the birth region
+  that are stored off in some old hashtable
+  somewhere? Or stuff added to a global object?
+
+  The birth region has a write barrier: an
+  array of pointers to any object which has
+  recently changed. If a new object is added
+  to a tuple, it's the tuple's job to notify
+  GC so that the tuple will get scanned on
+  the next GC pass.
+
+  What happens when the old generation runs
+  out of room? A new old generation is
+  allocated and we do a major collection:
+  the call stack is scanned and everything from
+  the birth region AND the full-to-the-brim
+  older region are both scanned and moved on
+  to the new generation.
+
+  This all has some obvious pitfalls. First,
+  that's a lot of memory moving around all
+  the time -- pointers moving around. And,
+  second, that's a lot of scanning to do:
+  does the entire heap have to be scanned
+  every time there's a major collection?
+
+  Yes, it's a lot of work and I hope to get
+  some real benchmarks and determine a new
+  strategy to buy some speed: either through
+  introducing a third generation or by
+  defragmenting memory or by allowing pages
+  to be partially unmapped. Probably the last
+  one: I'll weight sections of the older
+  generation and then clear out those sections
+  as they become more sparse.
+
+  As for moving pointers around, that's
+  why the volatile keyword is a part of the
+  PN typedef.
+
+  Does Potion perform exact GC? Not strictly.
+  During the stack scanning phase, Potion has
+  no idea what pointers are legit. For now,
+  this is resolved by investigating the header
+  of each pointer's object for a valid type
+  object. The type can then be compared with
+  the contents of the object to be sure the
+  object is real. To me, this feels exact
+  enough. (If, in practice, it proves to
+  be too messy, I may resort to using a
+  macro to identify exact pointers, just as
+  Qish does.)
+
+
+  ~ the volatile keyword ~
+
+  Since objects move freely about, Potion
+  requires use of the volatile keyword for
+  all access to object ids (PN) from C.
+  As most people don't readily understand
+  the volatile keyword, let's go over it.
+
+  There are three common uses of the volatile
+  keyword in Potion code:
+
+    PN string = potion_byte_str("...");
+
+  Since `volatile` is part of the PN typedef
+  this code actually means:
+
+    volatile unsigned long string =
+      potion_byte_str("...");
+
+  In this case, the `volatile` keyword will
+  generally prevent the PN from being stored
+  in a system register when the code is
+  optimized. Even for caching purposes.
+
+  So any time the `string` variable is used,
+  it'll be looked up directly on the stack.
+  This means the code won't be optimized fully,
+  but it also means the value will be looked
+  up every time we use it, in case GC has changed
+  the object's place on us.
+
+    struct PNObject * volatile string = ...;
+
+  If we cast the string to a PNObject pointer,
+  we need to be sure to place the `volatile`
+  keyword after the star. This tells the compiler
+  that the _pointer_ is the volatile one, not the
+  struct itself.
+
+    struct PNUserType {
+      PN_OBJECT_HEADER
+      PN a, b, c;
+    };
+
+  Lastly, in any structs which are wrapped by
+  a Potion object, you need to be sure that any
+  object handles are marked volatile as well.
+  In the above case, the PN typedef handles that.
+
+  This is a bit tedious to keep in mind, but
+  is compensated for by Potion's automatic stack
+  scanning (a technique which has brought easy
+  C extensions to Ruby) and object convention
+  (if your object pointers are all 8-byte aligned,
+  you won't need to write a GC marking function.)
+
+
+  ~ the fixed memory section ~
+
+  Potion does have one other section of
+  memory: a permanent generation containing
+  all of the objects that are used to bootstrap
+  Potion's environment. The Lobby object, the
+  class lookup table, the GC structures, etc.
+
+  This section of memory is positioned at the
+  beginning of the first birth area. After the
+  birth area, fills that memory is detached
+  (like the saucer section of the Enterprise)
+  and lives its life independantly of the other
+  regions, not to be moved or released until
+  the Potion interpreter is destroyed.
+
+
+  ~ object overhead ~
+
+  Primitives (such as numbers, booleans and nil) are
+  immediate values in Potion, kept in registers.
+
+  Everything else is given a spot in memory. Every
+  allocated object has a single word header specifying
+  its type. Here's a breakdown of what each object looks
+  like on 32-bit:
+
+    PNObject = 4 + (N * 4) bytes
+      4 bytes (type = 0x250009)
+      N * 4 bytes (each object field)
+
+    PNWeakRef = 8 bytes
+      4 bytes (type = 0x250004)
+      4 bytes (pointer to object)
+
+    PNString = 13 + N bytes
+      4 bytes (type = 0x250003)
+      4 bytes (length of string)
+      4 bytes (an incremental id used as hash)
+      N + 1 bytes (UTF-8 + '\0')
+
+    PNBytes = 9 + N bytes
+      4 bytes (type = 0x25000c)
+      4 bytes (length of string)
+      N + 1 bytes (string + '\0')
+
+    PNTuple = 8 + (N * 4) bytes
+      4 bytes (type = 0x250006)
+      4 bytes (length of tuple)
+      N * 4 bytes (each tuple item)
+
+    PNClosure = 16 + (N * 4) bytes
+      4 bytes (type = 0x25005)
+      4 bytes (function pointer)
+      4 bytes (signature pointer)
+      4 bytes (length of attached data)
+      N * 4 bytes (attached data)
+
+    PNData = 8 + N bytes
+      4 bytes (type = 0x250011)
+      4 bytes (length of contained data)
+      N bytes (data)
+
+  The smallest allocation unit in Potion is
+  16 bytes. Everything larger than 16 bytes
+  is aligned to 8 bytes. This is true for both
+  32-bit and 64-bit platforms.
+
+  The reason for this figure is to allow room for
+  the PNFwd struct:
+
+    unsigned int  // POTION_FWD or POTION_COPIED
+    unsigned int  // allocated space in this slot
+    unsigned long // pointer to moved object
+
+  Any time an object is moved by GC or reallocated,
+  a temporary PNFwd is placed in the memory slot to
+  redirect callers temporarily. In practice, you
+  shouldn't ever need to deal with these values,
+  since the stack scanning phase will rewrite them
+  automatically.
+
+  The first type of PNFwd is POTION_FWD. This type
+  is used for reallocation. Potion only has four
+  built-in types that are subject to reallocation:
+  tuples, tables, byte strings, and internal buffers.
+  (Internal buffers are used by the JIT to store
+  machine code output and by the object model to
+  keep an array of type classes in circulation.)
+
+  The POTION_FWD pointers will happen between GC
+  cycles, so they stay in place for awhile. The
+  API around those four built-ins is designed to
+  check for forwarded pointers whenever they're
+  passed in as an object. One the next GC cycle
+  hits all the pointers will be updated to use
+  the new objects (even if POTION_FWD occurs in
+  the old generation, due to the write barrier.)
+
+  The other PNFwd type is a POTION_COPIED pointer.
+  This is used by the GC to denote an object which
+  has moved to the old generation. These should
+  not appear outside the GC cycle. The PNFwd is
+  placed immediately when the object is moved and
+  is then used to rewrite pointers found on the
+  stack or inside other objects. After the GC
+  cycle, these pointers will disappear when the
+  its outdated generation is discarded.
+
 

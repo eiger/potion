@@ -1,33 +1,36 @@
-SRC = core/compile.c core/contrib.c core/file.c core/internal.c core/number.c core/objmodel.c core/primitive.c core/pn-ast.c core/pn-gram.c core/pn-scan.c core/string.c core/table.c core/vm.c
+.SUFFIXES: .g .c .o
+
+SRC = core/asm.c core/ast.c core/callcc.c core/compile.c core/contrib.c core/file.c core/gc.c core/internal.c core/lick.c core/mt19937ar.c core/number.c core/objmodel.c core/primitive.c core/string.c core/syntax.c core/table.c core/vm.c core/vm-ppc.c core/vm-x86.c
 OBJ = ${SRC:.c=.o}
 OBJ_POTION = core/potion.o
 OBJ_TEST = test/api/potion-test.o test/api/CuTest.o
+OBJ_GC_TEST = test/api/gc-test.o test/api/CuTest.o
+OBJ_GC_BENCH = test/api/gc-bench.o
+DOC = doc/start.textile
+DOCHTML = ${DOC:.textile=.html}
 
 PREFIX = /usr/local
 CC = gcc
-CFLAGS = -Wall -fno-strict-aliasing
+CFLAGS = -Wall -fno-strict-aliasing -Wno-return-type
 DEBUG ?= 0
 ECHO = /bin/echo
+GREG = tools/greg
 INCS = -Icore
 JIT ?= 1
-LEMON = tools/lemon
 LIBS = -lm
-RAGEL = ragel
 STRIP ?= `./tools/config.sh ${CC} strip`
 
 # TODO: -O2 doesn't include -fno-stack-protector
-DEBUGFLAGS = `${ECHO} "${DEBUG}" | sed "s/0/-O2 -DICACHE -DMCACHE/; s/1/-g -DDEBUG/"`
+DEBUGFLAGS = `${ECHO} "${DEBUG}" | sed "s/0/-O2/; s/1/-g -DDEBUG/"`
 CFLAGS += ${DEBUGFLAGS}
-JITFLAGS = `${ECHO} "${JIT}" | sed "s/0/-DNO_JIT/; s/1/-DX86_JIT/"`
-CFLAGS += ${JITFLAGS}
 
-VERSION = `cat core/potion.h | sed "/POTION_VERSION/!d; s/\\\"$$//; s/.*\\\"//"`
-PKG := "potion-${VERSION}"
+VERSION = `./tools/config.sh ${CC} version`
 DATE = `date +%Y-%m-%d`
-REVISION = `git rev-list HEAD | wc -l`
+REVISION = `git rev-list HEAD | wc -l | sed "s/ //g"`
 COMMIT = `git rev-list HEAD -1 --abbrev=7 --abbrev-commit`
 
-RAGELV = `${RAGEL} -v | sed "/ version /!d; s/.* version //; s/ .*//"`
+RELEASE ?= ${VERSION}.${REVISION}
+PKG := "potion-${RELEASE}"
 
 all: potion
 	+${MAKE} -s usage
@@ -80,13 +83,15 @@ core/version.h:
 	@${ECHO} "#define POTION_COMMIT \"${COMMIT}\"" >> core/version.h
 	@${ECHO} "#define POTION_REV    ${REVISION}" >> core/version.h
 	@${ECHO} >> core/version.h
-	@${ECHO} "#define POTION_RAGEL  \"${RAGELV}\"" >> core/version.h
-	@${ECHO} >> core/version.h
 
 core/config.h: core/version.h
 	@${ECHO} MAKE $@
 	@cat core/version.h > core/config.h
 	@${MAKE} -s config >> core/config.h
+
+core/callcc.o: core/callcc.c
+	@${ECHO} CC $< +frame-pointer
+	@${CC} -c -fno-omit-frame-pointer ${INCS} -o $@ $<
 
 %.o: %.c core/config.h
 	@${ECHO} CC $<
@@ -96,22 +101,17 @@ core/config.h: core/version.h
 	@${ECHO} CC $<
 	@${CC} -c ${CFLAGS} ${INCS} -o $@ $<
 
-core/pn-scan.c: core/pn-scan.rl
-	@if [ "${RAGELV}" != "6.3" ]; then \
-		if [ "${RAGELV}" != "6.2" ]; then \
-			${ECHO} "** potion may not work with ragel ${RAGELV}! try version 6.2 or 6.3."; \
-		fi; \
-	fi
-	@${ECHO} RAGEL core/pn-scan.rl
-	@${RAGEL} core/pn-scan.rl -C -o $@
+%.c: %.g tools/greg
+	@${ECHO} GREG $<
+	@${GREG} $< > $@
 
-core/pn-gram.c: tools/lemon core/pn-gram.y
-	@${ECHO} LEMON core/pn-gram.y
-	@${LEMON} core/pn-gram.y
+.g.c: tools/greg
+	@${ECHO} GREG $<
+	@${GREG} $< > $@
 
-tools/lemon: tools/lemon.c
-	@${ECHO} CC tools/lemon.c
-	@${CC} -o tools/lemon tools/lemon.c
+tools/greg: tools/greg.c tools/compile.c tools/tree.c
+	@${ECHO} CC $@
+	@${CC} -O3 -DNDEBUG -o $@ tools/greg.c tools/compile.c tools/tree.c -Itools
 
 potion: ${OBJ_POTION} ${OBJ}
 	@${ECHO} LINK potion
@@ -121,10 +121,17 @@ potion: ${OBJ_POTION} ${OBJ}
 	  ${STRIP} potion; \
 	fi
 
-test: potion test/api/potion-test
+bench: potion test/api/gc-bench
+	@${ECHO}; \
+	${ECHO} running GC benchmark; \
+	time test/api/gc-bench
+
+test: potion test/api/potion-test test/api/gc-test
 	@${ECHO}; \
 	${ECHO} running API tests; \
 	test/api/potion-test; \
+	${ECHO} running GC tests; \
+	test/api/gc-test; \
 	count=0; failed=0; pass=0; \
 	while [ $$pass -lt 3 ]; do \
 	  ${ECHO}; \
@@ -174,29 +181,50 @@ test/api/potion-test: ${OBJ_TEST} ${OBJ}
 	@${ECHO} LINK potion-test
 	@${CC} ${CFLAGS} ${OBJ_TEST} ${OBJ} ${LIBS} -o $@
 
-tarball: core/version.h core/pn-scan.c core/pn-gram.c
+test/api/gc-test: ${OBJ_GC_TEST} ${OBJ}
+	@${ECHO} LINK gc-test
+	@${CC} ${CFLAGS} ${OBJ_GC_TEST} ${OBJ} ${LIBS} -o $@
+
+test/api/gc-bench: ${OBJ_GC_BENCH} ${OBJ}
+	@${ECHO} LINK gc-bench
+	@${CC} ${CFLAGS} ${OBJ_GC_BENCH} ${OBJ} ${LIBS} -o $@
+
+tarball: core/version.h core/syntax.c
 	mkdir -p pkg
 	rm -rf ${PKG}
-	git-checkout-index --prefix=${PKG}/ -a
+	git checkout-index --prefix=${PKG}/ -a
 	rm -f ${PKG}/.gitignore
 	cp core/version.h ${PKG}/core/
-	cp core/pn-scan.c ${PKG}/core/
-	cp core/pn-gram.c ${PKG}/core/
+	cp core/syntax.c ${PKG}/core/
 	tar czvf pkg/${PKG}.tar.gz ${PKG}
 	rm -rf ${PKG}
 
+%.html: %.textile
+	@${ECHO} DOC $<
+	@${ECHO} "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"DTD/xhtml1-transitional.dtd\">" > $@
+	@${ECHO} "<html xmlns=\"http://www.w3.org/1999/xhtml\" lang=\"en\" xml:lang=\"en\">" >> $@
+	@${ECHO} "<head><meta http-equiv=\"Content-Type\" content=\"text/html; charset=utf-8\" />" >> $@
+	@${ECHO} "<style type=\"text/css\">@import 'doc.css';</style>" >> $@
+	@${ECHO} "<div id='potion'><img src='potion-1.png' /></div>" >> $@
+	@${ECHO} "</head><body><div id='central'>" >> $@
+	@redcloth $< >> $@
+	@${ECHO} "</div></body></html>" >> $@
+
+doc: ${DOCHTML}
+
 sloc: clean
-	@cp core/pn-scan.rl core/pn-scan-rl.c
+	@cp core/syntax.g core/syntax-g.c
 	@sloccount core
-	@rm -f core/pn-scan-rl.c
+	@rm -f core/syntax-g.c
 
 todo:
 	@grep -rInso 'TODO: \(.\+\)' core
 
 clean:
 	@${ECHO} cleaning
-	@rm -f ${OBJ} ${OBJ_POTION} ${OBJ_TEST}
-	@rm -f core/config.h core/version.h core/pn-gram.c core/pn-gram.h core/pn-gram.out core/pn-scan.c
-	@rm -f potion potion.exe test/api/potion-test
+	@rm -f ${OBJ} ${OBJ_POTION} ${OBJ_TEST} ${OBJ_GC_TEST} ${OBJ_GC_BENCH} ${DOCHTML}
+	@rm -f tools/greg tools/greg.o tools/compile.o tools/tree.o
+	@rm -f core/config.h core/version.h core/syntax.c
+	@rm -f potion potion.exe test/api/potion-test test/api/gc-test test/api/gc-bench
 
-.PHONY: all clean rebuild test
+.PHONY: all clean doc rebuild test
